@@ -1,0 +1,138 @@
+//@version=6
+strategy("200 EMA Long/Cash + Vol Target (hourly checks)", overlay = true,
+     initial_capital = 100000,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     process_orders_on_close = true, pyramiding = 0,
+     margin_long = 0)    // TradingView's own margin calls off: the script's margin rule below decides
+
+// Run on a 1-hour chart. EMA and vol are DAILY; the check happens at every hourly close.
+
+// ---- Inputs ----
+smaLen       = input.int(200, "EMA length (daily)", minval = 1)
+weeklyEntry  = input.bool(true, "New positions only on one day per week (exits any hour)")
+entryDay     = input.string("Friday", "Entry day", options = ["First trading day", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"])
+longPct      = input.float(95, "Long size (% of equity, before leverage)", minval = 0, maxval = 100, step = 5)
+bandPct      = input.float(0.0, "Band % around EMA (0 = none)", minval = 0, step = 0.5) / 100
+
+grpL         = "Leverage / Vol target"
+useVT        = input.bool(true, "Use vol target", group = grpL)
+targetVol    = input.float(20, "Target annual vol %", minval = 1, step = 1, group = grpL) / 100
+volLen       = input.int(21, "Realized vol lookback (days)", minval = 2, group = grpL)
+maxLev       = input.float(2.0, "Leverage (x) — fixed if vol target off, cap if on", minval = 0.1, maxval = 10, step = 0.25, group = grpL)
+minLev       = input.float(1.0, "Min leverage (x) — vol target only adds leverage above this", minval = 0, maxval = 10, step = 0.25, group = grpL)
+levCap       = input.float(1.2, "De-lever any day leverage drifts above (x the target)", minval = 1.0, step = 0.05, group = grpL,
+     tooltip = "Between monthly resizes, losses push leverage up. If the position grows past this multiple of its target, it is cut back to target that day.")
+rebalTol     = input.float(0, "Monthly resize: skip if size is off by less than %", minval = 0, step = 1, group = grpL) / 100
+
+grpM         = "Margin call (your own rule)"
+useMargin    = input.bool(true, "Use my margin rule", group = grpM,
+     tooltip = "Called when the price falls 1 / leverage from entry - where the margin is used up (equity reaches zero). 2x: -50%, 3x: -33.3%, 1.5x: -66.7%, 1x: never.")
+mBuffer      = input.float(0, "Maintenance buffer % of position value (0 = called at zero equity)", minval = 0, maxval = 50, step = 1, group = grpM,
+     tooltip = "Optional cushion: called a little earlier, when equity falls to this % of the position value. 0 matches 1 / leverage exactly.")
+reEnterAfterCall = input.bool(true, "After a margin call, allow re-entry on the next entry day", group = grpM)
+mmr = mBuffer / 100
+
+startDate    = input.time(timestamp("01 Jan 1970 00:00 +0000"), "Start date")
+
+// ---- Daily values from the last COMPLETED day (no repainting) ----
+emaPrev = request.security(syminfo.tickerid, "D", ta.ema(close, smaLen)[1], lookahead = barmerge.lookahead_on)
+rv      = request.security(syminfo.tickerid, "D", (ta.stdev(math.log(close / close[1]), volLen) * math.sqrt(252))[1], lookahead = barmerge.lookahead_on)
+
+// Live daily EMA: what today's EMA would be if the day closed at this hour's price
+sma   = emaPrev + 2.0 / (smaLen + 1) * (close - emaPrev)
+upper = sma * (1 + bandPct)
+lower = sma * (1 - bandPct)
+
+// Vol target only kicks in when it calls for MORE than minLev (default 1.0x); otherwise hold minLev
+float vtLev = rv > 0 ? targetVol / rv : maxLev
+lev = useVT ? math.min(maxLev, math.max(minLev, vtLev)) : maxLev
+
+var int side  = 0   // +1 long, 0 cash
+var int trend = 0   // +1 above EMA, -1 below
+var bool calledOut = false   // true after a margin call when re-entry is switched off
+
+// First trading day of the week (every hour of that day can open a position)
+var int wkFirstDay = na
+int today = time("D")
+if timeframe.change("W")
+    wkFirstDay := today
+bool isWeekStartDay = today == wkFirstDay
+int dow             = dayofweek(time)
+bool isEntryDay     = switch entryDay
+    "First trading day" => isWeekStartDay
+    "Monday"            => dow == dayofweek.monday
+    "Tuesday"           => dow == dayofweek.tuesday
+    "Wednesday"         => dow == dayofweek.wednesday
+    "Thursday"          => dow == dayofweek.thursday
+    => dow == dayofweek.friday
+bool canEnter       = weeklyEntry ? isEntryDay : true
+
+// Resize only at the first trading window (first bar) of each month
+bool isMonthStart   = timeframe.change("M")
+
+bool checkBar = time >= startDate and not na(emaPrev) and not na(rv) and barstate.isconfirmed
+
+// ---- Margin rule: checked first, on the bar's LOW (worst price inside the hour) ----
+// Equity = cash (negative when borrowed) + shares x price. At entry with leverage L, equity reaches zero
+// when price falls 1/L. Gains since entry push the call price lower; resizes move it with the new size.
+float posQty   = strategy.position_size
+float cashBal  = strategy.equity - posQty * close          // negative when levered (borrowed)
+float eqAtLow  = cashBal + posQty * low
+float callPx   = posQty > 0 and mmr < 1 ? -cashBal / (posQty * (1 - mmr)) : na   // price that triggers the call
+bool marginHit = useMargin and barstate.isconfirmed and posQty > 0 and eqAtLow <= mmr * posQty * low
+
+if marginHit
+    strategy.close_all(comment = "MARGIN CALL")
+    alert("200 EMA: MARGIN CALL " + syminfo.ticker + " - low " + str.tostring(low, format.mintick)
+         + " hit the call price " + str.tostring(callPx, format.mintick) + ", sold to cash", alert.freq_once_per_bar_close)
+    side := 0
+    if not reEnterAfterCall
+        calledOut := true
+
+if checkBar and not marginHit
+    trend := close > upper ? 1 : close < lower ? -1 : (trend != 0 ? trend : (close >= sma ? 1 : -1))
+    int signal = trend == 1 ? 1 : 0
+
+    // Exits: any hour the signal no longer matches the open position
+    int newSide = side
+    if side != 0 and signal != side
+        newSide := 0
+    // Entries: only on the first trading day of the week (or any hour if weeklyEntry is off)
+    if newSide == 0 and canEnter and not calledOut
+        newSide := signal
+
+    float desired = newSide == 0 ? 0.0 : math.floor(strategy.equity * longPct / 100 * lev / close)
+    float cur     = strategy.position_size
+
+    bool changed    = newSide != side
+    // leverage drift guard: losses raise leverage between monthly resizes; trim back to target if it runs too high
+    bool overLev    = newSide == 1 and cur > 0 and cur > desired * levCap
+    bool needResize = overLev or isMonthStart and not changed and newSide == 1 and desired != cur and (cur == 0 or math.abs(desired - cur) / cur > rebalTol)
+
+    if changed or needResize
+        float delta = desired - cur
+        if delta > 0
+            strategy.order("Buy", strategy.long, qty = delta)
+        else if delta < 0
+            if desired == 0
+                strategy.close_all(comment = "Exit")              // flat: never sells past zero, so no short can open
+            else
+                strategy.order("Sell", strategy.short, qty = math.min(-delta, cur))
+
+        string px  = str.tostring(close, format.mintick)
+        string sz  = " | lev " + str.tostring(lev, "#.##") + "x, rv " + str.tostring(rv * 100, "#.#") + "%"
+        string msg = not changed ? "RESIZE " : newSide == 1 ? "GO LONG " : "EXIT LONG (to cash until entry day) "
+        alert("200 EMA: " + msg + syminfo.ticker + " @ " + px + sz, alert.freq_once_per_bar_close)
+
+    side := newSide
+
+// ---- Visuals ----
+plot(sma, "EMA (live daily)", color = color.orange, linewidth = 2)
+plot(bandPct > 0 ? upper : na, "Upper band", color = color.new(color.orange, 60))
+plot(bandPct > 0 ? lower : na, "Lower band", color = color.new(color.orange, 60))
+plot(useMargin and callPx > 0 ? callPx : na, "Margin call price", color = color.red, style = plot.style_linebr)
+plot(lev, "Leverage", display = display.data_window)
+plot(posQty > 0 and callPx > 0 ? (close - callPx) / close * 100 : na, "Drop to margin call %", display = display.data_window)
+plot(rv * 100, "Realized vol %", display = display.data_window)
+bgcolor(side == 1 ? color.new(color.green, 90) : na)
+bgcolor(marginHit ? color.new(color.red, 60) : na)
