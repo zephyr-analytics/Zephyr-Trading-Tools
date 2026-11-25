@@ -1,0 +1,240 @@
+//@version=6
+strategy("ADX/DMI + TEO - Kalshi (simplified)", overlay = false,
+     initial_capital = 500,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 95,
+     margin_long = 1, margin_short = 1,   // TradingView margin calls off; Kalshi liquidation simulated below
+     commission_type = strategy.commission.percent, commission_value = 0.018,
+     pyramiding = 0)
+
+// HOW IT WORKS (daily bars, decided at the close)
+//  Simplified from "ADX/DMI Z-Score - Kalshi": the ADX-slope check and all z-score logic
+//  (divergence hold, convergence exit, early z shorts) are removed - testing showed they
+//  barely changed results. Gap = +DI - -DI.
+//
+//  LONGS
+//  Direction    : +DI leads -DI by the buffer (was the slope engine with min slope = 0).
+//  Line engine  : long state = +DI above ADX and -DI at/below it. Exit when +DI crosses under ADX,
+//                 or the market is ranging (both DIs same side of ADX) and the gap is not widening upward.
+//  Entry        : direction turns on while +DI is above ADX, or the line engine turns long while
+//                 direction holds.
+//  Exit         : line-engine exit once direction no longer backs the trade, OR a short signal from
+//                 either engine (to cash), OR a TEO short (flip).
+//
+//  SHORTS (TEO only) - unchanged
+//  TEO = net price move / total path over N days (-1 to +1), EMA-smoothed. Raw TEO levels.
+//  Entry        : TEO at or below -entry level and red above green.
+//  Hold         : while TEO stays below -hold level, the regular short exits are ignored.
+//  Exit         : once TEO is back at/above the hold level - green at/above red, a long signal or a
+//                 line-engine exit. At any time - a buy signal (flip long) or liquidation. After a short
+//                 closes while the entry condition still holds, no re-short until it clears and returns.
+//
+//  Kalshi model : separate fixed long / short leverage, fees on full size, liquidation at (1/lev - fee - maintenance),
+//                 funding + interest tracked in the table (the Strategy Tester can't book them).
+
+// ───────── Inputs ─────────
+diLen    = input.int(10, "DI Length", group = "ADX / DMI")
+adxLen   = input.int(14, "ADX Smoothing", group = "ADX / DMI")
+diBuf    = input.float(2.0, "+DI / -DI lead for direction (points)", minval = 0, step = 0.5, group = "Direction")
+divLen   = input.int(2, "Gap widening window (days)", minval = 2, group = "Direction",
+     tooltip = "While ranging, a long is kept only if the +DI/-DI gap's slope over this many days is still widening upward.")
+minSpread = input.float(8.0, "Min spread for longs: highest minus lowest of +DI / -DI / ADX (points)", minval = 0, step = 0.5, group = "Line spread",
+     tooltip = "Longs only: hold or open a long only while the highest of the three lines is at least this far above the lowest. Below it, a long is closed. TEO shorts ignore this. 0 = off.")
+
+teoLen   = input.int(20, "TEO length (days)", minval = 2, group = "TEO shorts")
+teoSm    = input.int(7, "TEO smoothing (EMA)", minval = 1, group = "TEO shorts")
+teoSLvl  = input.float(0.15, "Short entry: TEO at or below minus this", minval = 0, step = 0.05, group = "TEO shorts")
+teoHLvl  = input.float(0.00, "Short hold: ignore regular exits while TEO is below minus this", minval = 0, step = 0.05, group = "TEO shorts")
+
+startDate = input.time(timestamp("2016-01-01"), "Backtest start", group = "Trading")
+
+levLong  = input.float(3.0, "Long leverage (x)", minval = 0.1, step = 0.05, group = "Leverage (Kalshi)")
+levShort = input.float(1.5, "Short leverage (x)", minval = 0.1, step = 0.05, group = "Leverage (Kalshi)")
+maxLev   = input.float(5.8, "Kalshi max leverage (BTC 5.8, ETH 4.4)", minval = 1, step = 0.1, group = "Leverage (Kalshi)")
+allocPct = input.float(95, "Allocation (% of equity, before leverage)", minval = 1, maxval = 100, step = 1, group = "Leverage (Kalshi)")
+mmrPct   = input.float(-1, "Maintenance margin (% of size, -1 = auto = 50% of 1/max lev)", step = 0.1, group = "Leverage (Kalshi)")
+liqFee   = input.float(0.02, "Fee (%) - keep equal to Properties > Commission", minval = 0, step = 0.01, group = "Leverage (Kalshi)")
+
+fundAnn   = input.float(7.0, "Assumed funding (% per year, + = longs pay)", step = 0.5, group = "Carry (Kalshi)")
+winPerDay = input.int(3, "Funding windows per day (crypto 3)", minval = 1, group = "Carry (Kalshi)")
+fundCap   = input.float(2.0, "Funding cap per window (%)", minval = 0, step = 0.1, group = "Carry (Kalshi)")
+intPos    = input.float(7.0, "Interest on margin in a position (% per year, at >= min lev)", minval = 0, step = 0.5, group = "Carry (Kalshi)")
+intPosLev = input.float(1.5, "Min leverage for position interest", minval = 1, step = 0.1, group = "Carry (Kalshi)")
+intCash   = input.float(3.5, "Interest on idle cash (% per year)", minval = 0, step = 0.5, group = "Carry (Kalshi)")
+
+// ───────── Core values ─────────
+[diPlus, diMinus, adx] = ta.dmi(diLen, adxLen)
+gap     = diPlus - diMinus
+started = time >= startDate
+effLevL = math.min(levLong, maxLev)
+effLevS = math.min(levShort, maxLev)
+
+var int pos     = 0     // 1 long, -1 short, 0 cash
+
+// Liquidated by the broker emulator -> back to cash
+if pos != 0 and strategy.position_size == 0 and strategy.closedtrades > nz(strategy.closedtrades[1])
+    pos := 0
+
+// Gap slope (is the +DI/-DI gap widening?)
+gapSlope = ta.linreg(gap, divLen, 0) - ta.linreg(gap, divLen, 1)
+
+// ───────── TEO (trend efficiency) ─────────
+teoPath   = math.sum(math.abs(close - close[1]), teoLen)
+teoRaw    = teoPath > 0 ? (close - close[teoLen]) / teoPath : 0.0
+teo       = teoSm > 1 ? ta.ema(teoRaw, teoSm) : teoRaw
+teoSCond  = teo <= -teoSLvl and diMinus > diPlus                   // TEO short condition
+teoHold   = teo < -teoHLvl                                         // TEO still backs the short
+
+// ───────── Direction (formerly the slope engine with min slope 0) ─────────
+dirBull = gap >=  diBuf
+dirBear = gap <= -diBuf
+
+dirLongE  = dirBull and not dirBull[1]
+dirShortE = dirBear and not dirBear[1]
+
+// ───────── Line engine ─────────
+ranging    = (diPlus > adx and diMinus > adx) or (diPlus < adx and diMinus < adx)
+longState  = diPlus  > adx and diMinus <= adx
+shortState = diMinus > adx and diPlus  <= adx
+widenUp    = gap > 0 and gapSlope > 0          // gap widening in the long direction
+widenDn    = gap < 0 and gapSlope < 0
+
+lineLongE  = longState  and not longState[1]
+lineShortE = shortState and not shortState[1]
+
+plusCrossDn   = ta.crossunder(diPlus, adx)
+minusCrossDn  = ta.crossunder(diMinus, adx)
+lineExitLong  = plusCrossDn  or (ranging and not widenUp)
+lineExitShort = minusCrossDn or (ranging and not widenDn)
+
+// ───────── Entry / exit decisions ─────────
+lineSupLong = diPlus > adx and gap > 0
+
+// Spread between the highest and lowest of the three lines
+lineHi   = math.max(diPlus, diMinus, adx)
+lineLo   = math.min(diPlus, diMinus, adx)
+spreadOK = lineHi - lineLo >= minSpread
+
+tightExit = minSpread > 0 and not spreadOK              // lines bunched together: close longs (shorts are TEO-only)
+
+// Long entry: a fresh trigger with the spread already open, OR the spread opening up
+// while the long conditions still hold (so a trend isn't skipped because it started bunched)
+longReady   = dirBull and lineSupLong
+spreadOpenE = minSpread > 0 and spreadOK and not spreadOK[1] and longReady
+normLong    = (((dirLongE and lineSupLong) or (lineLongE and dirBull)) and spreadOK) or spreadOpenE
+
+longSig  = started and normLong
+rawShort = started and (dirShortE or lineShortE)    // engine short signal - closes longs only
+rawLong  = started and (dirLongE  or lineLongE)     // engine long signal - can close shorts (when TEO no longer holds)
+
+goLong = longSig and pos != 1
+
+var bool teoSLock = false             // set when a short closes while the entry condition still holds; cleared when it clears
+if teoSLock and not teoSCond
+    teoSLock := false
+goShort = started and teoSCond and not teoSLock and pos != -1
+
+sellOnly   = rawShort and pos == 1 and not goShort
+closeLong  = started and pos == 1  and ((lineExitLong and not dirBull) or tightExit) and not goShort and not sellOnly
+coverOnly  = rawLong and pos == -1 and not goLong
+greenOverS = diPlus >= diMinus
+softExitS  = (lineExitShort and not dirBear) or greenOverS or coverOnly
+closeShort = started and pos == -1 and not goLong and softExitS and not teoHold
+
+// ───────── Kalshi carry (funding paid / interest earned) ─────────
+var float fundingPaid    = 0.0
+var float interestEarned = 0.0
+barDays     = timeframe.in_seconds() / 86400.0
+posNotional = math.abs(strategy.position_size) * close
+sideSign    = strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
+perWindow   = math.max(math.min(fundAnn / 365 / winPerDay, fundCap), -fundCap)
+heldLev     = sideSign < 0 ? effLevS : effLevL
+marginUsed  = sideSign != 0 ? posNotional / heldLev : 0.0
+idleCash    = math.max(strategy.equity - fundingPaid + interestEarned - marginUsed, 0)
+if started
+    fundingPaid    += sideSign * posNotional * perWindow / 100 * winPerDay * barDays
+    posIntRate      = sideSign != 0 and heldLev >= intPosLev ? intPos : 0.0
+    interestEarned += (marginUsed * posIntRate + idleCash * intCash) / 100 / 365 * barDays
+carryPaid = fundingPaid - interestEarned
+netEquity = strategy.equity - carryPaid
+
+var float netPeak  = na
+var float netMaxDD = 0.0
+netPeak  := na(netPeak) ? netEquity : math.max(netPeak, netEquity)
+netMaxDD := math.max(netMaxDD, netPeak > 0 ? (netPeak - netEquity) / netPeak : 0)
+
+qtyLong  = math.max(netEquity, 0) * allocPct / 100 * effLevL / close
+qtyShort = math.max(netEquity, 0) * allocPct / 100 * effLevS / close
+
+// ───────── Orders ─────────
+flipFromTeoShort = pos == -1 and teoSCond     // a buy is about to close a short while the TEO condition still holds
+if goLong
+    strategy.entry("Long", strategy.long, qty = qtyLong, comment = "Long")
+    pos := 1
+    if flipFromTeoShort
+        teoSLock := true
+    alert("ADX/DMI: BUY " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+else if closeShort
+    whyS = "Close short:" + (greenOverS ? " green>red" : "") + (coverOnly ? " long-signal" : "") + ((lineExitShort and not dirBear) ? " line-exit" : "")
+    strategy.close("Short", comment = whyS)
+    pos := 0
+    if teoSCond
+        teoSLock := true
+    alert("ADX/DMI: CLOSE SHORT " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+if goShort
+    strategy.entry("Short", strategy.short, qty = qtyShort, comment = "Short (TEO)")
+    pos := -1
+    alert("ADX/DMI: SHORT " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+else if sellOnly or closeLong
+    strategy.close("Long", comment = sellOnly ? "Close long: short signal" : tightExit ? "Close long: lines bunched" : "Close long")
+    pos := 0
+    alert("ADX/DMI: CLOSE LONG " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// ───────── Kalshi liquidation (intrabar stop) ─────────
+newEntry = goLong or goShort or strategy.position_size == 0
+entryPx  = newEntry ? close : strategy.position_avg_price
+mmrFrac  = mmrPct < 0 ? 0.5 / maxLev : mmrPct / 100
+posLev   = pos == -1 ? effLevS : effLevL
+liqMove  = entryPx * math.max(1 / posLev - liqFee / 100 - mmrFrac, 0.0001)
+if pos == 1
+    strategy.exit("Liq L", from_entry = "Long",  stop = entryPx - liqMove, comment = "Liquidated")
+if pos == -1
+    strategy.exit("Liq S", from_entry = "Short", stop = entryPx + liqMove, comment = "Liquidated")
+
+// ───────── Visuals ─────────
+plot(diPlus,  "+DI", color = color.lime)
+plot(diMinus, "-DI", color = color.red)
+plot(adx, "ADX", color = color.orange, linewidth = 2)
+plot(lineHi - lineLo, "Line spread (high - low)", display = display.data_window + display.status_line)
+// TEO is drawn as a percent (x100, -100 to +100) so it is visible next to the lines - drawing only.
+plot(teo * 100, "TEO %", color = teoSCond ? color.red : teoHold ? color.orange : color.aqua, linewidth = 2)
+plot(-teoSLvl * 100, "TEO short entry level %", color = color.new(color.red, 30), style = plot.style_circles, linewidth = 1)
+hline(0, "Zero", color = color.new(color.gray, 50))
+plot(teo, "TEO (raw)", display = display.data_window + display.status_line)
+
+plotshape(goLong,  "Buy",   shape.triangleup,   location.bottom, color.lime, size = size.small)
+plotshape(goShort, "Short", shape.triangledown, location.top,    color.red,  size = size.small)
+plotshape((closeLong or sellOnly) and not goShort, "Close long",  shape.circle, location.top,    color.gray, size = size.tiny)
+plotshape(closeShort,                              "Close short", shape.circle, location.bottom, color.gray, size = size.tiny)
+
+bgcolor(strategy.position_size > 0 ? color.new(color.lime, 90) : strategy.position_size < 0 ? color.new(color.red, 90) : na, title = "Position")
+
+// ───────── Results table ─────────
+var table tbl = table.new(position.top_left, 2, 6, bgcolor = color.new(color.black, 15), border_width = 1)
+if barstate.islast
+    netAfter = strategy.netprofit + strategy.openprofit - carryPaid
+    w = color.white
+    table.cell(tbl, 0, 0, "Net profit (tester)", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 0, str.tostring(strategy.netprofit + strategy.openprofit, "#,##0"), text_color = w, text_size = size.small)
+    table.cell(tbl, 0, 1, "Funding paid (net)", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 1, str.tostring(fundingPaid, "#,##0"), text_color = color.orange, text_size = size.small)
+    table.cell(tbl, 0, 2, "Interest earned", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 2, str.tostring(interestEarned, "#,##0"), text_color = color.lime, text_size = size.small)
+    table.cell(tbl, 0, 3, "Return after carry", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 3, str.tostring(netAfter / strategy.initial_capital * 100, "#,##0.0") + "%", text_color = netAfter >= 0 ? color.lime : color.red, text_size = size.small)
+    table.cell(tbl, 0, 4, "Max drawdown after carry", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 4, str.tostring(netMaxDD * 100, "0.0") + "%", text_color = w, text_size = size.small)
+    liqL = (1 / effLevL - liqFee / 100 - mmrFrac) * 100
+    liqS = (1 / effLevS - liqFee / 100 - mmrFrac) * 100
+    table.cell(tbl, 0, 5, "Leverage L / S (liq. distance)", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 5, str.tostring(effLevL, "0.00") + "x (" + str.tostring(liqL, "0.0") + "%) / " + str.tostring(effLevS, "0.00") + "x (" + str.tostring(liqS, "0.0") + "%)", text_color = w, text_size = size.small)
