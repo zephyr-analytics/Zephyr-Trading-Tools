@@ -1,0 +1,232 @@
+//@version=6
+indicator("ADX/DMI + TEO Signals (live) - Kalshi (simplified)", overlay = false, max_labels_count = 500)
+
+// Indicator version of "ADX/DMI + TEO - Kalshi (simplified)" (same rules and defaults as the strategy).
+// The ADX-slope check and all z-score logic were removed - testing showed they barely changed results.
+// LIVE: the signal is worked out on the OPEN candle, tick by tick, as if the candle closed right now.
+// It can change (or disappear) until the daily candle closes; at the close it becomes the confirmed signal.
+// Position tracking assumes you trade at the signal price (the close, or the live price on the open candle).
+//
+//  LONGS  : direction (+DI leads -DI by the buffer) and the line engine must agree.
+//           Exit on the line-engine exit once direction stops backing it, an engine short signal (to cash)
+//           or a TEO short (flip).
+//  SHORTS : TEO only (raw levels). Entry: TEO <= -(short entry level) and red above green.
+//           While TEO stays below -(hold level) the regular short exits are ignored. Once TEO is back at/above it:
+//           green at/above red, a long signal or a line-engine exit closes it. A buy signal (flip long)
+//           or liquidation closes it at any time.
+//           After a short closes while the entry condition still holds, no re-short until it clears.
+
+// ───────── Inputs (keep equal to the strategy) ─────────
+diLen    = input.int(10, "DI Length", group = "ADX / DMI")
+adxLen   = input.int(14, "ADX Smoothing", group = "ADX / DMI")
+diBuf    = input.float(2.0, "+DI / -DI lead for direction (points)", minval = 0, step = 0.5, group = "Direction")
+divLen   = input.int(2, "Gap widening window (days)", minval = 2, group = "Direction",
+     tooltip = "While ranging, a long is kept only if the +DI/-DI gap's slope over this many days is still widening upward.")
+minSpread = input.float(8.0, "Min spread for longs: highest minus lowest of +DI / -DI / ADX (points)", minval = 0, step = 0.5, group = "Line spread",
+     tooltip = "Longs only: hold or open a long only while the highest of the three lines is at least this far above the lowest. Below it, a long is closed. TEO shorts ignore this. 0 = off.")
+
+teoLen   = input.int(20, "TEO length (days)", minval = 2, group = "TEO shorts")
+teoSm    = input.int(7, "TEO smoothing (EMA)", minval = 1, group = "TEO shorts")
+teoSLvl  = input.float(0.15, "Short entry: TEO at or below minus this", minval = 0, step = 0.05, group = "TEO shorts")
+teoHLvl  = input.float(0.0, "Short hold: ignore regular exits while TEO is below minus this", minval = 0, step = 0.05, group = "TEO shorts")
+teoSigLen = input.int(6, "TEO signal line (EMA of TEO)", minval = 1, group = "TEO shorts",
+     tooltip = "Display only - the signal line does not change the trading rules.")
+showTeoX  = input.bool(false, "Mark TEO / signal line crosses", group = "TEO shorts")
+
+startDate = input.time(timestamp("2018-01-01"), "Start tracking from", group = "Trading")
+
+levLong  = input.float(3.0, "Long leverage (x)", minval = 0.1, step = 0.05, group = "Leverage (Kalshi)")
+levShort = input.float(1.5, "Short leverage (x)", minval = 0.1, step = 0.05, group = "Leverage (Kalshi)")
+maxLev   = input.float(5.8, "Kalshi max leverage (BTC 5.8, ETH 4.4)", minval = 1, step = 0.1, group = "Leverage (Kalshi)")
+mmrPct   = input.float(-1, "Maintenance margin (% of size, -1 = auto = 50% of 1/max lev)", step = 0.1, group = "Leverage (Kalshi)")
+liqFee   = input.float(0.02, "Fee (%)", minval = 0, step = 0.01, group = "Leverage (Kalshi)")
+
+tblPos = input.string("top_left", "Table position", options = ["top_left", "top_right", "bottom_left", "bottom_right"], group = "Display")
+
+// ───────── Core values ─────────
+[diPlus, diMinus, adx] = ta.dmi(diLen, adxLen)
+gap     = diPlus - diMinus
+started = time >= startDate
+effLevL = math.min(levLong, maxLev)
+effLevS = math.min(levShort, maxLev)
+mmrFrac = mmrPct < 0 ? 0.5 / maxLev : mmrPct / 100
+
+// `var` state rolls back on every tick of the open candle, so each tick re-decides
+// "what happens if the candle closed now" from the last CONFIRMED state.
+var int   pos      = 0      // 1 long, -1 short, 0 cash
+var float entryPx  = na
+var float liqPx    = na
+var int   entryBar = na
+var bool  teoSLock = false
+
+confirmedPos = pos          // position going into this candle
+
+// ───────── Liquidation (price touches the Kalshi liquidation level after the entry candle) ─────────
+liquidated = false
+if pos == 1 and bar_index > entryBar and low <= liqPx
+    liquidated := true
+    pos := 0
+if pos == -1 and bar_index > entryBar and high >= liqPx
+    liquidated := true
+    pos := 0
+
+// Gap slope (is the +DI/-DI gap widening?)
+gapSlope = ta.linreg(gap, divLen, 0) - ta.linreg(gap, divLen, 1)
+
+// ───────── TEO ─────────
+teoPath   = math.sum(math.abs(close - close[1]), teoLen)
+teoRaw    = teoPath > 0 ? (close - close[teoLen]) / teoPath : 0.0
+teo       = teoSm > 1 ? ta.ema(teoRaw, teoSm) : teoRaw
+teoSCond  = teo <= -teoSLvl and diMinus > diPlus
+teoHold   = teo < -teoHLvl
+teoSig    = ta.ema(teo, teoSigLen)                     // TEO signal line (display only)
+teoXUp    = ta.crossover(teo, teoSig)
+teoXDn    = ta.crossunder(teo, teoSig)
+
+// ───────── Direction (formerly the slope engine with min slope 0) ─────────
+dirBull = gap >=  diBuf
+dirBear = gap <= -diBuf
+
+dirLongE  = dirBull and not dirBull[1]
+dirShortE = dirBear and not dirBear[1]
+
+// ───────── Line engine ─────────
+ranging    = (diPlus > adx and diMinus > adx) or (diPlus < adx and diMinus < adx)
+longState  = diPlus  > adx and diMinus <= adx
+shortState = diMinus > adx and diPlus  <= adx
+widenUp    = gap > 0 and gapSlope > 0
+widenDn    = gap < 0 and gapSlope < 0
+
+lineLongE  = longState  and not longState[1]
+lineShortE = shortState and not shortState[1]
+
+plusCrossDn   = ta.crossunder(diPlus, adx)
+minusCrossDn  = ta.crossunder(diMinus, adx)
+lineExitLong  = plusCrossDn  or (ranging and not widenUp)
+lineExitShort = minusCrossDn or (ranging and not widenDn)
+
+// ───────── Decisions ─────────
+lineSupLong = diPlus > adx and gap > 0
+// Spread between the highest and lowest of the three lines
+lineHi      = math.max(diPlus, diMinus, adx)
+lineLo      = math.min(diPlus, diMinus, adx)
+spreadOK    = lineHi - lineLo >= minSpread
+
+tightExit = minSpread > 0 and not spreadOK              // lines bunched together: close longs (shorts are TEO-only)
+
+// Long entry: a fresh trigger with the spread already open, OR the spread opening up
+// while the long conditions still hold (so a trend isn't skipped because it started bunched)
+longReady   = dirBull and lineSupLong
+spreadOpenE = minSpread > 0 and spreadOK and not spreadOK[1] and longReady
+normLong    = (((dirLongE and lineSupLong) or (lineLongE and dirBull)) and spreadOK) or spreadOpenE
+
+longSig  = started and normLong
+rawShort = started and (dirShortE or lineShortE)
+rawLong  = started and (dirLongE  or lineLongE)
+
+goLong = longSig and pos != 1
+if teoSLock and not teoSCond
+    teoSLock := false
+goShort = started and teoSCond and not teoSLock and pos != -1
+
+sellOnly   = rawShort and pos == 1 and not goShort
+closeLong  = started and pos == 1  and ((lineExitLong and not dirBull) or tightExit) and not goShort and not sellOnly
+coverOnly  = rawLong and pos == -1 and not goLong
+softExitS  = (lineExitShort and not dirBear) or diPlus >= diMinus or coverOnly
+closeShort = started and pos == -1 and not goLong and softExitS and not teoHold
+
+flipFromTeoShort = pos == -1 and teoSCond
+closeLongNow  = (sellOnly or closeLong) and not goShort
+closeShortNow = closeShort and not goLong
+
+if goLong
+    if flipFromTeoShort
+        teoSLock := true
+    pos      := 1
+    entryPx  := close
+    entryBar := bar_index
+    liqPx    := close * (1 - math.max(1 / effLevL - liqFee / 100 - mmrFrac, 0.0001))
+else if closeShortNow
+    if teoSCond
+        teoSLock := true
+    pos := 0
+if goShort
+    pos      := -1
+    entryPx  := close
+    entryBar := bar_index
+    liqPx    := close * (1 + math.max(1 / effLevS - liqFee / 100 - mmrFrac, 0.0001))
+else if closeLongNow
+    pos := 0
+if pos == 0
+    entryPx := na
+    liqPx   := na
+
+// ───────── Visuals ─────────
+live = not barstate.isconfirmed           // open candle: signal not final yet
+tr   = live ? 50 : 0
+
+plot(diPlus,  "+DI", color = color.lime)
+plot(diMinus, "-DI", color = color.red)
+plot(adx, "ADX", color = color.orange, linewidth = 2)
+plot(lineHi - lineLo, "Line spread (high - low)", display = display.data_window + display.status_line)
+plot(teo * 100, "TEO %", color = teoSCond ? color.red : teoHold ? color.orange : color.aqua, linewidth = 2)
+plot(teoSig * 100, "TEO signal %", color = color.new(color.yellow, 0), linewidth = 1)
+plot(showTeoX and teoXUp ? teo * 100 : na, "TEO crosses above signal", color = color.new(color.aqua, tr), style = plot.style_circles, linewidth = 4)
+plot(showTeoX and teoXDn ? teo * 100 : na, "TEO crosses below signal", color = color.new(color.fuchsia, tr), style = plot.style_circles, linewidth = 4)
+plot(-teoSLvl * 100, "TEO short entry level %", color = color.new(color.red, 30), style = plot.style_circles, linewidth = 1)
+hline(0, "Zero", color = color.new(color.gray, 50))
+plot(teo, "TEO (raw)", display = display.data_window + display.status_line)
+plot(teoSig, "TEO signal (raw)", display = display.data_window + display.status_line)
+
+plotshape(goLong,  "Buy",   shape.triangleup,   location.bottom, color.new(color.lime, tr), size = size.small)
+plotshape(goShort, "Short", shape.triangledown, location.top,    color.new(color.red,  tr), size = size.small)
+plotshape(closeLongNow,  "Close long",  shape.circle, location.top,    color.new(color.gray, tr), size = size.tiny)
+plotshape(closeShortNow, "Close short", shape.circle, location.bottom, color.new(color.gray, tr), size = size.tiny)
+plotshape(liquidated, "Liquidation level hit", shape.xcross, location.top, color.new(color.orange, tr), size = size.small)
+
+bgcolor(pos == 1 ? color.new(color.lime, live ? 94 : 90) : pos == -1 ? color.new(color.red, live ? 94 : 90) : na, title = "Position")
+
+// ───────── Status table ─────────
+tPos = tblPos == "top_left" ? position.top_left : tblPos == "top_right" ? position.top_right : tblPos == "bottom_left" ? position.bottom_left : position.bottom_right
+var table tbl = table.new(tPos, 2, 9, bgcolor = color.new(color.black, 15), border_width = 1)
+
+sigTxt(p) => p == 1 ? "LONG" : p == -1 ? "SHORT" : "CASH"
+sigCol(p) => p == 1 ? color.lime : p == -1 ? color.red : color.gray
+
+if barstate.islast
+    w = color.white
+    changed = pos != confirmedPos
+    action = goLong ? (confirmedPos == -1 ? "FLIP TO LONG" : "BUY") : goShort ? (confirmedPos == 1 ? "FLIP TO SHORT" : "SHORT") : closeLongNow ? "CLOSE LONG" : closeShortNow ? "CLOSE SHORT" : liquidated ? "LIQUIDATED" : "HOLD"
+    msLeft = time_close - timenow
+    hrs    = math.max(msLeft, 0) / 3600000.0
+
+    table.cell(tbl, 0, 0, live ? "Signal NOW (open candle)" : "Signal (closed candle)", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 0, sigTxt(pos) + (changed ? "  <- " + action : ""), text_color = sigCol(pos), text_size = size.small)
+    table.cell(tbl, 0, 1, "Confirmed at last close", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 1, sigTxt(confirmedPos), text_color = sigCol(confirmedPos), text_size = size.small)
+    table.cell(tbl, 0, 2, "Candle closes in", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 2, live ? str.tostring(hrs, "0.0") + " h  (signal can still change)" : "closed", text_color = live ? color.yellow : w, text_size = size.small)
+    table.cell(tbl, 0, 3, "Entry price", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 3, na(entryPx) ? "-" : str.tostring(entryPx, format.mintick), text_color = w, text_size = size.small)
+    table.cell(tbl, 0, 4, "Liquidation price", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 4, na(liqPx) ? "-" : str.tostring(liqPx, format.mintick) + "  (" + str.tostring(math.abs(liqPx / close - 1) * 100, "0.0") + "% away)", text_color = color.orange, text_size = size.small)
+    table.cell(tbl, 0, 5, "Leverage", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 5, pos == 1 ? str.tostring(effLevL, "0.00") + "x long" : pos == -1 ? str.tostring(effLevS, "0.00") + "x short" : "-", text_color = w, text_size = size.small)
+    table.cell(tbl, 0, 6, "TEO (entry <= " + str.tostring(-teoSLvl, "0.00") + ")", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 6, str.tostring(teo, "0.00") + (teoSCond ? "  SHORT ZONE" : teoHold ? "  below hold level - shorts held" : ""), text_color = teoSCond ? color.red : teoHold ? color.orange : color.aqua, text_size = size.small)
+    table.cell(tbl, 0, 8, "TEO signal (" + str.tostring(teoSigLen) + ")", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 8, str.tostring(teoSig, "0.00") + (teo > teoSig ? "  TEO above" : "  TEO below"), text_color = teo > teoSig ? color.aqua : color.fuchsia, text_size = size.small)
+    table.cell(tbl, 0, 7, "+DI / -DI / ADX", text_color = w, text_size = size.small)
+    table.cell(tbl, 1, 7, str.tostring(diPlus, "0.0") + " / " + str.tostring(diMinus, "0.0") + " / " + str.tostring(adx, "0.0"), text_color = w, text_size = size.small)
+
+// ───────── Alerts ─────────
+// LIVE alerts fire once per candle the first time a signal appears on the open candle (it may still change).
+// CONFIRMED alerts fire once at the daily close.
+actTxt = goLong ? (confirmedPos == -1 ? "FLIP TO LONG" : "BUY") : goShort ? (confirmedPos == 1 ? "FLIP TO SHORT" : "SHORT") : closeLongNow ? "CLOSE LONG" : closeShortNow ? "CLOSE SHORT" : ""
+if actTxt != ""
+    if live
+        alert("ADX/DMI LIVE (not final until close): " + actTxt + " " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar)
+    else
+        alert("ADX/DMI CONFIRMED: " + actTxt + " " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+if liquidated
+    alert("ADX/DMI: LIQUIDATION LEVEL HIT " + syminfo.ticker, alert.freq_once_per_bar)
