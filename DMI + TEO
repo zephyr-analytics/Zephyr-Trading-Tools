@@ -1,0 +1,133 @@
+//@version=6
+indicator("DMI + TEO (price only)", shorttitle = "DMI + TEO", overlay = false)
+
+// ONE pane, PRICE ONLY - no volume anywhere (matches the downturn study: DI 10, ADX 15, line smoothing EMA 3, TEO 20 / 7).
+//
+// DMI - Wilder's directional movement: +DI (green) = strength of up-moves, -DI (red) = strength of down-moves,
+//   each = RMA(+DM or -DM) / RMA(true range). Optional extra smoothing on the two lines (EMA 3 by default);
+//   ADX is built from the smoothed lines. Shading: red when -DI leads, green when +DI leads.
+// TEO - Trend Efficiency Oscillator (Kaufman efficiency ratio), in % on the same scale:
+//   (close - close N bars ago) / sum(|daily change|) over N bars, EMA-smoothed. -100 = straight down, +100 = straight up.
+//   Zone lines are fixed: -18 / -3 / +14 / +34 %.
+// Works on any symbol, including indexes with no volume (SPX, NDX).
+
+// ───────── Inputs: DMI ─────────
+diLen     = input.int(10, "DI Length", minval = 1, group = "ADX / DMI")
+adxLen    = input.int(15, "ADX Smoothing", minval = 1, group = "ADX / DMI")
+smoothLen = input.int(3, "Line smoothing length (1 = off)", minval = 1, group = "Smoothing",
+     tooltip = "Extra moving average on the +DI / -DI lines. Higher = smoother lines and fewer false crosses, but later signals (EMA 3 costs about 1 bar).")
+smoothTyp = input.string("EMA", "Smoothing type", options = ["EMA", "SMA", "RMA", "WMA"], group = "Smoothing")
+
+// ───────── Inputs: TEO ─────────
+teoLen   = input.int(20, "TEO length (bars)", minval = 2, group = "TEO")
+teoSm    = input.int(7, "TEO smoothing (EMA, 1 = off)", minval = 1, group = "TEO")
+sigLen   = input.int(6, "TEO signal line (EMA of TEO, 0 = off)", minval = 0, group = "TEO")
+lowZone  = input.float(-0.18, "Low zone at/below", step = 0.01, group = "TEO zones")
+midLo    = input.float(-0.03, "Mid-low line", step = 0.01, group = "TEO zones")
+midHi    = input.float(0.14, "Mid-high line", step = 0.01, group = "TEO zones")
+highZone = input.float(0.34, "High zone at/above", step = 0.01, group = "TEO zones")
+
+// ───────── Inputs: display ─────────
+showDMI   = input.bool(true, "Show the DMI lines", group = "Display")
+showADX   = input.bool(true, "Show ADX", group = "Display")
+showTEO   = input.bool(true, "Show TEO", group = "Display")
+showZones = input.bool(true, "Show the TEO zone lines", group = "Display")
+showMid   = input.bool(true, "Show the TEO mid lines", group = "Display")
+showSig   = input.bool(true, "Mark red / green crosses", group = "Display")
+showBg    = input.bool(true, "Shade by which line leads", group = "Display")
+refLevel  = input.float(20, "Reference line level", group = "Display")
+showTbl   = input.bool(true, "Show the table", group = "Display")
+tblPos    = input.string("top_left", "Table position", options = ["top_left", "top_right", "bottom_left", "bottom_right"], group = "Display")
+tblSizeS  = input.string("Small", "Table text size", options = ["Tiny", "Small", "Normal", "Large"], group = "Display")
+
+// ───────── DMI (price only) ─────────
+upMv    = ta.change(high)
+dnMv    = -ta.change(low)
+plusDM  = na(upMv) ? na : (upMv > dnMv and upMv > 0 ? upMv : 0)
+minusDM = na(dnMv) ? na : (dnMv > upMv and dnMv > 0 ? dnMv : 0)
+trR     = ta.rma(ta.tr(true), diLen)
+plusR   = trR > 0 ? 100 * ta.rma(plusDM, diLen) / trR : na
+minusR  = trR > 0 ? 100 * ta.rma(minusDM, diLen) / trR : na
+
+smooth(float x) =>
+    e = ta.ema(x, smoothLen)
+    s = ta.sma(x, smoothLen)
+    r = ta.rma(x, smoothLen)
+    wm = ta.wma(x, smoothLen)
+    smoothLen <= 1 ? x : smoothTyp == "SMA" ? s : smoothTyp == "RMA" ? r : smoothTyp == "WMA" ? wm : e
+
+diPlus  = smooth(plusR)
+diMinus = smooth(minusR)
+diSum   = diPlus + diMinus
+adx     = 100 * ta.rma(math.abs(diPlus - diMinus) / (diSum == 0 ? 1 : diSum), adxLen)
+
+isRed   = diMinus > diPlus
+isGreen = diPlus > diMinus
+redX    = ta.crossover(diMinus, diPlus)
+greenX  = ta.crossover(diPlus, diMinus)
+var int redDays   = 0
+var int greenDays = 0
+redDays   := isRed ? redDays + 1 : 0
+greenDays := not isRed and not na(diPlus) ? greenDays + 1 : 0
+
+// ───────── TEO (price only) ─────────
+chg  = close - close[1]
+path = math.sum(math.abs(chg), teoLen)
+raw  = path > 0 ? (close - close[teoLen]) / path : 0.0
+teo  = teoSm > 1 ? ta.ema(raw, teoSm) : raw
+sig  = sigLen > 0 ? ta.ema(teo, sigLen) : na
+
+inLow  = teo <= lowZone
+inHigh = teo >= highZone
+var int zoneDays = 0
+zoneNow = inLow ? -2 : teo < midLo ? -1 : teo <= midHi ? 0 : not inHigh ? 1 : 2
+zoneDays := zoneNow == zoneNow[1] ? zoneDays + 1 : 1
+teoCol = inLow ? color.red : teo < midLo ? color.orange : teo <= midHi ? color.gray : not inHigh ? color.aqua : color.lime
+
+// ───────── Plots ─────────
+plot(showDMI ? diPlus : na,  "+DI",  color = color.lime, linewidth = 2)
+plot(showDMI ? diMinus : na, "-DI",  color = color.red,  linewidth = 2)
+plot(showADX ? adx : na,     "ADX",  color = color.orange, linewidth = 2)
+plot(diMinus - diPlus, "Red - green", display = display.data_window + display.status_line)
+hline(refLevel, "Reference level", color = color.new(color.yellow, 30), linestyle = hline.style_dashed)
+hline(0, "Zero", color = color.new(color.gray, 50))
+
+plot(showTEO ? teo * 100 : na, "TEO %", color = teoCol, linewidth = 2)
+plot(showTEO and sigLen > 0 ? sig * 100 : na, "TEO signal %", color = color.new(color.yellow, 40), linewidth = 1)
+plot(showTEO and showZones ? lowZone * 100 : na, "TEO low zone", color = color.new(color.red, 30), style = plot.style_circles, linewidth = 1)
+plot(showTEO and showZones ? highZone * 100 : na, "TEO high zone", color = color.new(color.lime, 30), style = plot.style_circles, linewidth = 1)
+plot(showTEO and showZones and showMid ? midLo * 100 : na, "TEO mid-low", color = color.new(color.orange, 50), style = plot.style_circles)
+plot(showTEO and showZones and showMid ? midHi * 100 : na, "TEO mid-high", color = color.new(color.aqua, 70), style = plot.style_circles)
+
+plotshape(showSig and redX,   "Red over green", shape.triangledown, location.top,    color.red,  size = size.tiny)
+plotshape(showSig and greenX, "Green over red", shape.triangleup,   location.bottom, color.lime, size = size.tiny)
+bgcolor(showBg and isRed ? color.new(color.red, 90) : showBg and isGreen ? color.new(color.lime, 92) : na, title = "Which line leads")
+
+// ───────── Table ─────────
+tPos = tblPos == "top_left" ? position.top_left : tblPos == "top_right" ? position.top_right : tblPos == "bottom_left" ? position.bottom_left : position.bottom_right
+tSz  = tblSizeS == "Tiny" ? size.tiny : tblSizeS == "Normal" ? size.normal : tblSizeS == "Large" ? size.large : size.small
+var table tbl = table.new(tPos, 2, 4, bgcolor = color.new(color.black, 15), border_width = 1)
+
+cell(c, r, txt, clr) =>
+    table.cell(tbl, c, r, txt, text_color = clr, text_size = tSz)
+
+if barstate.islast and showTbl
+    w = color.white
+    cell(0, 0, "DMI" + (smoothLen > 1 ? " (" + smoothTyp + " " + str.tostring(smoothLen) + ")" : ""), w)
+    cell(1, 0, isRed ? "RED leads " + str.tostring(redDays) + " bars" : "GREEN leads " + str.tostring(greenDays) + " bars",
+         isRed ? color.red : color.lime)
+    cell(0, 1, "-DI / +DI / ADX", w)
+    cell(1, 1, str.tostring(diMinus, "0.0") + " / " + str.tostring(diPlus, "0.0") + " / " + str.tostring(adx, "0.0")
+         + (adx > adx[5] ? "  ADX ↑" : "  ADX ↓"), w)
+    cell(0, 2, "Red - green", w)
+    cell(1, 2, str.tostring(diMinus - diPlus, "+0.0;-0.0"), isRed ? color.red : color.lime)
+    zoneTxt = zoneNow == -2 ? "LOW zone (strong down)" : zoneNow == -1 ? "mid-low" : zoneNow == 0 ? "neutral / chop" : zoneNow == 1 ? "mid-high" : "HIGH zone (strong up)"
+    cell(0, 3, "TEO", w)
+    cell(1, 3, str.tostring(teo * 100, "+0.0;-0.0") + "%" + (teo > teo[1] ? "  ↑" : teo < teo[1] ? "  ↓" : "") + " · " + zoneTxt + " · "
+         + str.tostring(zoneDays) + " bars", teoCol)
+
+// ───────── Alerts ─────────
+alertcondition(redX,    "Red over green", "DMI: -DI crossed above +DI on {{ticker}}")
+alertcondition(greenX,  "Green over red", "DMI: +DI crossed above -DI on {{ticker}}")
+alertcondition(ta.crossunder(teo, lowZone), "TEO into low zone", "TEO dropped into the low zone on {{ticker}}")
+alertcondition(ta.crossover(teo, highZone), "TEO into high zone", "TEO rose into the high zone on {{ticker}}")
