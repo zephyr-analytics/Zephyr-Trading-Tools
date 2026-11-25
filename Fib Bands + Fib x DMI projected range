@@ -1,0 +1,218 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Fibonacci band math and plots from "MA Signals + Fibonacci Bands" © zephyrcapitalgroup (MPL 2.0),
+// combined with the "Fib Bands x DMI - projected range" projection in one overlay.
+
+//@version=6
+indicator("Fib Bands + Fib x DMI projected range", shorttitle = "FibBands+Range", overlay = true,
+     max_lines_count = 100, max_labels_count = 50, max_boxes_count = 50, max_bars_back = 5000)
+
+// Draws the "MA Signals + Fibonacci Bands" (midline + 6 bands up / 6 down) and, on the same overlay,
+// projects a range of possible moves from TODAY's situation, using this chart's own history. Price only (no volume).
+//  1. Every bar is classified by WHERE price sits in the "MA Signals + Fibonacci Bands" (189 EMA midline,
+//     zone -6..+6) and WHO leads on the DMI: RED (-DI above +DI) = sellers, GREEN (+DI at/above -DI) = buyers.
+//  2. For every past bar it records what price did over the next H1 / H2 bars (no look-ahead: a bar is
+//     only counted once those bars have closed).
+//  3. On the last bar it takes all past bars in the SAME zone + state as now and opens RECTANGLES of possible moves
+//     to the right of the current bar, one per horizon (today -> H1, H1 -> H2): middle 50% of outcomes
+//     (shaded box), 10th-90th percentile (dotted box) and the median (white line).
+//  If fewer than "Min cases" match, it widens to the neighbouring zones (same state) and says so in the table.
+//  Cases are days, and neighbouring days overlap - the table also shows how many separate EPISODES they come from.
+//  This is history, not a forecast: tall rectangles and few episodes mean low confidence.
+
+// ───────── Inputs ─────────
+maLength = input.int(200, "MA Length (Fib bands)", minval = 1, group = "Fib bands")
+maType   = input.string("EMA", "MA Type", options = ["EMA", "SMA"], group = "Fib bands")
+showBands    = input.bool(true, "Show the Fibonacci bands", group = "Fib bands")
+midlineWidth = input.int(2, "Midline Width", minval = 1, maxval = 5, group = "Fib bands")
+bandWidth    = input.int(1, "Band Width",    minval = 1, maxval = 5, group = "Fib bands")
+diLen    = input.int(10, "DI Length", minval = 1, group = "DMI")
+adxLen   = input.int(14, "ADX Smoothing", minval = 1, group = "DMI")
+diBuf    = input.float(0.0, "Lead needed for RED / GREEN (points, 0 = any lead)", minval = 0, step = 0.5, group = "DMI",
+     tooltip = "A bar only counts as RED or GREEN when one DI leads the other by at least this many points. Bars inside the buffer are not counted.")
+h1       = input.int(10, "Horizon 1 (bars)", minval = 1, maxval = 450, group = "Projection")
+h2       = input.int(20, "Horizon 2 (bars)", minval = 1, maxval = 450, group = "Projection")
+minN     = input.int(40, "Min cases before widening to neighbouring zones", minval = 5, group = "Projection")
+pOut     = input.float(10, "Outer percentile (and 100 minus it)", minval = 1, maxval = 49, group = "Projection")
+pIn      = input.float(25, "Inner percentile (and 100 minus it)", minval = 1, maxval = 49, group = "Projection")
+startT   = input.time(timestamp("2000-01-01"), "Count history from", group = "Projection")
+tblPos   = input.string("bottom_right", "Table position", options = ["top_left", "top_right", "bottom_left", "bottom_right"], group = "Display")
+showAll  = input.bool(true, "Show both horizons (off = only one rectangle out to Horizon 2)", group = "Display")
+tblSizeS = input.string("Small", "Table text size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = "Display")
+lblSizeS = input.string("Small", "Price label text size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = "Display")
+boxSizeS = input.string("Tiny", "Rectangle label text size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = "Display")
+toSize(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : s == "Large" ? size.large : s == "Huge" ? size.huge : size.small
+tblSize = toSize(tblSizeS)
+lblSize = toSize(lblSizeS)
+boxSize = toSize(boxSizeS)
+cMid     = input.color(color.white, "Median", group = "Display")
+cIn      = input.color(color.new(#3e8ef7, 0), "Middle 50%", group = "Display")
+cOut     = input.color(color.new(color.gray, 20), "Outer range", group = "Display")
+
+// ───────── Fib bands (same math as the original script) ─────────
+midline = maType == "EMA" ? ta.ema(close, maLength) : ta.sma(close, maLength)
+toc = math.max(open, close)
+boc = math.min(open, close)
+effclose = close >= open ? toc : boc
+dev = ta.stdev(effclose, maLength)
+plusdevmult  = (toc > midline and dev != 0.0) ? (toc - midline) / dev : 0.0
+minusdevmult = (boc < midline and dev != 0.0) ? (midline - boc) / dev : 0.0
+lm  = ta.ema(math.max(plusdevmult, minusdevmult), maLength)
+d   = close - midline
+ad  = math.abs(d)
+k   = ad > dev * lm * 1.61803399 ? 6 : ad > dev * lm * 1.38196601 ? 5 : ad > dev * lm ? 4 :
+      ad > dev * lm * 0.75 ? 3 : ad > dev * lm * 0.5 ? 2 : ad > dev * lm * 0.19098300 ? 1 : 0
+zone = na(dev) or na(lm) ? na : (d >= 0 ? k : -k)
+
+// ───────── Fib band plots (same levels the zones use: band n = zone boundary n) ─────────
+lm2 = lm / 2.0
+lm3 = lm2 * 0.38196601
+lm4 = lm * 1.38196601
+lm5 = lm * 1.61803399
+lm6 = (lm + lm2) / 2.0
+plot(showBands ? midline : na, title = "Midline (EMA / SMA)", color = color.white, linewidth = midlineWidth)
+plot(showBands ? midline + dev * lm5 : na, title = "6 up",   color = color.purple, linewidth = bandWidth)
+plot(showBands ? midline + dev * lm4 : na, title = "5 up",   color = color.blue,   linewidth = bandWidth)
+plot(showBands ? midline + dev * lm  : na, title = "4 up",   color = color.green,  linewidth = bandWidth)
+plot(showBands ? midline + dev * lm6 : na, title = "3 up",   color = color.yellow, linewidth = bandWidth)
+plot(showBands ? midline + dev * lm2 : na, title = "2 up",   color = color.orange, linewidth = bandWidth)
+plot(showBands ? midline + dev * lm3 : na, title = "1 up",   color = color.red,    linewidth = bandWidth)
+plot(showBands ? midline - dev * lm3 : na, title = "1 down", color = color.red,    linewidth = bandWidth)
+plot(showBands ? midline - dev * lm2 : na, title = "2 down", color = color.orange, linewidth = bandWidth)
+plot(showBands ? midline - dev * lm6 : na, title = "3 down", color = color.yellow, linewidth = bandWidth)
+plot(showBands ? midline - dev * lm  : na, title = "4 down", color = color.green,  linewidth = bandWidth)
+plot(showBands ? midline - dev * lm4 : na, title = "5 down", color = color.blue,   linewidth = bandWidth)
+plot(showBands ? midline - dev * lm5 : na, title = "6 down", color = color.purple, linewidth = bandWidth)
+
+// ───────── DMI (price only) ─────────
+[diPlus, diMinus, adx] = ta.dmi(diLen, adxLen)
+lead  = diMinus - diPlus
+state = na(diPlus) or na(diMinus) ? -1 : lead > diBuf ? 0 : -lead >= diBuf ? 1 : -1     // 0 RED, 1 GREEN, -1 not counted
+
+// ───────── History buckets: zone (-6..6) x state (RED / GREEN) ─────────
+type Bucket
+    array<float> r1
+    array<float> r2
+    int episodes = 0
+
+var array<Bucket> B = array.new<Bucket>()
+if barstate.isfirst
+    for i = 0 to 25
+        B.push(Bucket.new(array.new_float(), array.new_float(), 0))
+
+key(z, s) => int(z + 6) * 2 + int(s)
+
+// episodes: count each time price ENTERS a zone + state combination
+curKey = not na(zone) and state >= 0 ? key(zone, state) : -1
+if curKey >= 0 and curKey != nz(curKey[1], -1) and time >= startT
+    b = B.get(curKey)
+    b.episodes += 1
+
+// forward returns, added once the forward bars have closed
+addRet(int h, int which) =>
+    z = zone[h]
+    s = state[h]
+    if not na(z) and not na(s) and s >= 0 and time[h] >= startT and close[h] > 0
+        b = B.get(key(z, s))
+        r = (close / close[h] - 1) * 100
+        if which == 1
+            b.r1.push(r)
+        else
+            b.r2.push(r)
+
+addRet(h1, 1)
+addRet(h2, 2)
+
+pick(Bucket b, int which) => which == 1 ? b.r1 : b.r2
+
+// all returns for zone z (+/- width zones, same state)
+gather(int z, int s, int width, int which) =>
+    out = array.new_float()
+    for zz = math.max(z - width, -6) to math.min(z + width, 6)
+        out.concat(pick(B.get(key(zz, s)), which))
+    out
+
+episodesIn(int z, int s, int width) =>
+    n = 0
+    for zz = math.max(z - width, -6) to math.min(z + width, 6)
+        n += B.get(key(zz, s)).episodes
+    n
+
+// ───────── Projection (last bar only) ─────────
+var array<line>     drawn  = array.new<line>()
+var array<label>    tags   = array.new<label>()
+var array<box>      boxes  = array.new<box>()
+tPos = tblPos == "top_left" ? position.top_left : tblPos == "top_right" ? position.top_right : tblPos == "bottom_left" ? position.bottom_left : position.bottom_right
+var table tbl = table.new(tPos, 5, 5, bgcolor = color.new(color.black, 10), border_width = 1)
+
+pct(arr, p) => arr.size() > 0 ? arr.percentile_linear_interpolation(p) : na
+px(r) => close * (1 + r / 100)
+
+if barstate.islast
+    for l in drawn
+        l.delete()
+    for lb in tags
+        lb.delete()
+    for bx in boxes
+        bx.delete()
+    drawn.clear()
+    tags.clear()
+    boxes.clear()
+    w = color.white
+    if na(zone) or state < 0
+        table.cell(tbl, 0, 0, "No projection: " + (na(zone) ? "bands still warming up" : "+DI and -DI within the lead buffer"),
+             text_color = color.orange, text_size = tblSize)
+    else
+        // widen until the LONGEST horizon has enough cases
+        width = 0
+        while gather(zone, state, width, 2).size() < minN and width < 3
+            width += 1
+        hs = array.from(h1, h2)
+        prevX = bar_index + 1
+        table.cell(tbl, 0, 0, "Now: zone " + (zone > 0 ? "+" : "") + str.tostring(zone) + " · " + (state == 0 ? "RED (sellers)" : "GREEN (buyers)")
+             + (width > 0 ? " · widened ±" + str.tostring(width) + " zones" : ""), text_color = state == 0 ? color.red : color.lime, text_size = tblSize)
+        table.cell(tbl, 0, 1, "Horizon", text_color = w, text_size = tblSize)
+        table.cell(tbl, 1, 1, "Median", text_color = w, text_size = tblSize)
+        table.cell(tbl, 2, 1, str.tostring(pIn, "#") + "-" + str.tostring(100 - pIn, "#") + "%", text_color = w, text_size = tblSize)
+        table.cell(tbl, 3, 1, "% up", text_color = w, text_size = tblSize)
+        table.cell(tbl, 4, 1, "cases", text_color = w, text_size = tblSize)
+        for j = 0 to 1
+            h = hs.get(j)
+            arr = gather(zone, state, width, j + 1)
+            n = arr.size()
+            x = bar_index + h
+            if n > 0
+                m  = pct(arr, 50)
+                i1 = pct(arr, pIn)
+                i2 = pct(arr, 100 - pIn)
+                o1 = pct(arr, pOut)
+                o2 = pct(arr, 100 - pOut)
+                ups = 0
+                for r in arr
+                    ups += r > 0 ? 1 : 0
+                if showAll or j == 1
+                    left = showAll ? prevX : bar_index + 1
+                    boxes.push(box.new(left, px(o2), x, px(o1), border_color = cOut, border_style = line.style_dotted,
+                         border_width = 1, bgcolor = color.new(cOut, 94)))
+                    boxes.push(box.new(left, px(i2), x, px(i1), border_color = cIn, border_width = 1,
+                         bgcolor = color.new(cIn, 78)))
+                    drawn.push(line.new(left, px(m), x, px(m), color = cMid, width = 2))
+                    tags.push(label.new(x, px(i2), str.tostring(h) + "b: " + str.tostring(i1, "+0.0;-0.0") + " / "
+                         + str.tostring(i2, "+0.0;-0.0") + "%", style = label.style_label_lower_right,
+                         color = color.new(color.black, 100), textcolor = cIn, size = boxSize))
+                if j == 1
+                    tags.push(label.new(x, px(m), str.tostring(px(m), format.mintick) + "  (" + str.tostring(m, "+0.0;-0.0") + "%)",
+                         style = label.style_label_left, color = color.new(color.black, 40), textcolor = cMid, size = lblSize))
+                    tags.push(label.new(x, px(o2), str.tostring(px(o2), format.mintick) + "  (" + str.tostring(100 - pOut, "#") + "th)",
+                         style = label.style_label_left, color = color.new(color.black, 60), textcolor = color.lime, size = lblSize))
+                    tags.push(label.new(x, px(o1), str.tostring(px(o1), format.mintick) + "  (" + str.tostring(pOut, "#") + "th)",
+                         style = label.style_label_left, color = color.new(color.black, 60), textcolor = color.red, size = lblSize))
+                table.cell(tbl, 0, 2 + j, str.tostring(h) + " bars", text_color = w, text_size = tblSize)
+                table.cell(tbl, 1, 2 + j, str.tostring(m, "+0.0;-0.0") + "%", text_color = m >= 0 ? color.lime : color.red, text_size = tblSize)
+                table.cell(tbl, 2, 2 + j, str.tostring(i1, "+0.0;-0.0") + " / " + str.tostring(i2, "+0.0;-0.0") + "%", text_color = w, text_size = tblSize)
+                table.cell(tbl, 3, 2 + j, str.tostring(float(ups) / n * 100, "0") + "%", text_color = w, text_size = tblSize)
+                table.cell(tbl, 4, 2 + j, str.tostring(n), text_color = n < minN ? color.orange : w, text_size = tblSize)
+                prevX := x + 1
+        eps = episodesIn(zone, state, width)
+        table.cell(tbl, 0, 4, "from " + str.tostring(eps) + " separate episodes" + (eps < 10 ? " - LOW confidence" : ""),
+             text_color = eps < 10 ? color.orange : color.gray, text_size = tblSize)
+
